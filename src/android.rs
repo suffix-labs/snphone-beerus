@@ -7,6 +7,7 @@ use std::{
 
 use jni::{
     objects::{JClass, JIntArray, JString},
+    sys::jstring,
     JNIEnv,
 };
 
@@ -19,8 +20,10 @@ const RPC_SPEC_VERSION: &str = "0.6.0";
 
 // using to test that this can execute from android.
 // should be removed once that is working.
-fn run() {
-    println!("Running!");
+fn run(eth_execution_rpc: String, starknet_rpc: String) -> String {
+    format!(
+        "Running!\nETH RPC: {eth_execution_rpc}\nSTARKNET RPC: {starknet_rpc}"
+    )
 }
 
 /*
@@ -98,8 +101,7 @@ pub extern "C" fn Java_com_example_beerus_1android_Beerus_run<'local>(
     _class: JClass<'local>,
     eth_execution_rpc: JString<'local>,
     starknet_rpc: JString<'local>,
-    data_dir: JString<'local>,
-) {
+) -> jstring {
     let eth_execution_rpc: String = env
         .get_string(&eth_execution_rpc)
         .expect("Unable to get eth_execution_rpc string")
@@ -110,11 +112,11 @@ pub extern "C" fn Java_com_example_beerus_1android_Beerus_run<'local>(
         .expect("Unable to get starknet_rpc string")
         .into();
 
-    let data_dir: String = env
-        .get_string(&data_dir)
-        .expect("Unable to get data_dir string")
-        .into();
-
     //run(eth_execution_rpc, starknet_rpc, data_dir, 5, 8080);
-    run();
+    let run_result = run(eth_execution_rpc, starknet_rpc);
+    // creating a new java string to return to our android app
+    let output =
+        env.new_string(run_result).expect("Couldn't create a java string!");
+
+    output.into_raw()
 }
