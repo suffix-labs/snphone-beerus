@@ -96,7 +96,9 @@ async fn run(
 */
 
 #[no_mangle]
-pub extern "C" fn Java_com_example_beerus_1android_Beerus_run<'local>(
+pub extern "C" fn Java_com_snphone_lightclientservice_BeerusClient_run<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     eth_execution_rpc: JString<'local>,
