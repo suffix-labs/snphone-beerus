@@ -1,7 +1,8 @@
 use std::{collections::HashSet, num::NonZeroU128, sync::Arc};
 
 use blockifier::{
-    block::{BlockInfo, GasPrices},
+    blockifier::block::{BlockInfo, GasPrices},
+    bouncer::BouncerConfig,
     context::{BlockContext, ChainInfo, FeeTokenAddresses, TransactionContext},
     execution::{
         call_info::CallInfo,
@@ -10,7 +11,6 @@ use blockifier::{
         entry_point::{CallEntryPoint, CallType, EntryPointExecutionContext},
     },
     state::{
-        cached_state::CommitmentStateDiff,
         errors::StateError,
         state_api::{State as BlockifierState, StateReader, StateResult},
     },
@@ -19,7 +19,6 @@ use blockifier::{
     },
     versioned_constants::VersionedConstants,
 };
-use cairo_vm::vm::runners::cairo_runner::ExecutionResources;
 use starknet_api::{
     block::{BlockNumber as StarknetBlockNumber, BlockTimestamp},
     core::{
@@ -27,25 +26,30 @@ use starknet_api::{
         ContractAddress, EntryPointSelector, Nonce,
     },
     deprecated_contract_class::EntryPointType,
-    hash::{StarkFelt, StarkHash},
+    hash::StarkHash,
     state::StorageKey as StarknetStorageKey,
     transaction::{
         Calldata, Fee, TransactionHash, TransactionSignature,
         TransactionVersion,
     },
 };
+use starknet_types_core::felt::Felt as StarkFelt;
 
-use crate::gen::{self, blocking::Rpc};
+use crate::{
+    client::State,
+    gen::{self, blocking::Rpc},
+};
 
+pub mod cache;
 pub mod err;
 pub mod map;
 
 use err::Error;
 
-pub fn call(
-    client: &gen::client::blocking::Client,
+pub fn call<T: gen::client::blocking::HttpClient>(
+    client: gen::client::blocking::Client<T>,
     function_call: gen::FunctionCall,
-    state_root: gen::Felt,
+    state: State,
 ) -> Result<CallInfo, Error> {
     let gen::FunctionCall { calldata, contract_address, entry_point_selector } =
         function_call;
@@ -56,8 +60,6 @@ pub fn call(
     let contract_address: StarkFelt = contract_address.0.try_into()?;
 
     let entry_point_selector: StarkFelt = entry_point_selector.try_into()?;
-
-    let mut resources = ExecutionResources::default();
 
     let one = NonZeroU128::new(1)
         .ok_or_else(|| Error::Custom("NonZeroU128 is zero"))?;
@@ -75,19 +77,22 @@ pub fn call(
     };
 
     let chain_info = ChainInfo {
-        chain_id: BlockifierChainId("00".to_owned()),
+        chain_id: BlockifierChainId::Mainnet,
         fee_token_addresses: FeeTokenAddresses {
             strk_fee_token_address: ContractAddress::default(),
             eth_fee_token_address: ContractAddress::default(),
         },
     };
 
-    let versioned_constants = VersionedConstants::latest_constants();
+    let versioned_constants = VersionedConstants::latest_constants().to_owned();
 
-    let block_context = BlockContext::new_unchecked(
-        &block_info,
-        &chain_info,
+    let bouncer_config = BouncerConfig::default();
+
+    let block_context = BlockContext::new(
+        block_info,
+        chain_info,
         versioned_constants,
+        bouncer_config,
     );
 
     let tx_info = TransactionInfo::Deprecated(DeprecatedTransactionInfo {
@@ -106,11 +111,11 @@ pub fn call(
     });
 
     let tx_context = Arc::new(TransactionContext { block_context, tx_info });
-
+    let limit_steps_by_resources = false;
     let mut context = EntryPointExecutionContext::new(
         tx_context.clone(),
         ExecutionMode::Execute,
-        /*limit_steps_by_resources=*/ false,
+        limit_steps_by_resources,
     )?;
 
     let call_entry_point = CallEntryPoint {
@@ -125,86 +130,89 @@ pub fn call(
         initial_gas: u64::MAX,
     };
 
-    let diff = CommitmentStateDiff {
-        storage_updates: Default::default(),
-        address_to_nonce: Default::default(),
-        address_to_class_hash: Default::default(),
-        class_hash_to_compiled_class_hash: Default::default(),
-    };
-    let mut proxy = StateProxy { client: client.to_owned(), diff, state_root };
+    let state_proxy: StateProxy<T> = StateProxy { client, state };
+    let mut state_proxy = cache::CachedState::new(state_proxy);
 
-    let call_info =
-        call_entry_point.execute(&mut proxy, &mut resources, &mut context)?;
+    let mut resources = Default::default();
+    let call_info = call_entry_point.execute(
+        &mut state_proxy,
+        &mut resources,
+        &mut context,
+    )?;
 
     tracing::debug!(?call_info, "call completed");
     Ok(call_info)
 }
 
-struct StateProxy {
-    client: gen::client::blocking::Client,
-    diff: CommitmentStateDiff,
-    state_root: gen::Felt,
+struct StateProxy<T: gen::client::blocking::HttpClient> {
+    client: gen::client::blocking::Client<T>,
+    state: State,
 }
 
-impl StateReader for StateProxy {
+impl<T: gen::client::blocking::HttpClient> cache::HasBlockHash
+    for StateProxy<T>
+{
+    fn get_block_hash(&self) -> &gen::Felt {
+        &self.state.block_hash
+    }
+}
+
+impl<T: gen::client::blocking::HttpClient> StateReader for StateProxy<T> {
     fn get_storage_at(
-        &mut self,
+        &self,
         contract_address: ContractAddress,
-        key: StarknetStorageKey,
+        storage_key: StarknetStorageKey,
     ) -> StateResult<StarkFelt> {
-        tracing::info!(?contract_address, ?key, "get_storage_at");
+        tracing::info!(?contract_address, ?storage_key, "get_storage_at");
 
         let felt: gen::Felt = contract_address.0.key().try_into()?;
-        let contract_address = gen::Address(felt);
+        let address = gen::Address(felt);
 
-        let key = gen::StorageKey::try_new(&key.0.to_string())
+        let key = gen::StorageKey::try_new(&storage_key.0.to_string())
             .map_err(Into::<Error>::into)?;
 
-        let block_id = gen::BlockId::BlockTag(gen::BlockTag::Latest);
+        let block_id = gen::BlockId::BlockHash {
+            block_hash: gen::BlockHash(self.state.block_hash.clone()),
+        };
 
         let ret = self
             .client
-            .getStorageAt(
-                contract_address.clone(),
-                key.clone(),
-                block_id.clone(),
-            )
+            .getStorageAt(address.clone(), key.clone(), block_id.clone())
             .map_err(Into::<Error>::into)?;
+        tracing::info!(?address, ?key, value=?ret, "get_storage_at");
 
-        let proof = self
-            .client
-            .getProof(
-                block_id.clone(),
-                contract_address.clone(),
-                vec![key.clone()],
-            )
-            .map_err(Into::<Error>::into)?;
-        tracing::info!(?proof, "get_storage_at: proof received");
-
-        // TODO: find more elegant way for this
-        // workaround to skip proof validation for testing
-        #[cfg(feature = "skip-zero-root-validation")]
-        if self.state_root.as_ref() == "0x0" {
+        if ret.as_ref() == "0x0" {
+            tracing::info!("get_storage_at: skipping proof for zero value");
             return Ok(ret.try_into()?);
         }
 
-        let global_root = self.state_root.clone();
+        let proof = self
+            .client
+            .getProof(block_id, address.clone(), vec![key.clone()])
+            .map_err(Into::<Error>::into)?;
+        tracing::info!("get_storage_at: proof received");
+
+        let global_root = self.state.root.clone();
         let value = ret.clone();
-        proof.verify(global_root, contract_address, key, value).map_err(
-            |_| StateError::StateReadError("Invalid merkle proof".to_owned()),
-        )?;
+        proof.verify(global_root, address, key, value).map_err(|e| {
+            StateError::StateReadError(format!(
+                "Failed to verify merkle proof: {e:?}"
+            ))
+        })?;
         tracing::info!("get_storage_at: proof verified");
 
         Ok(ret.try_into()?)
     }
 
     fn get_nonce_at(
-        &mut self,
+        &self,
         contract_address: ContractAddress,
     ) -> StateResult<Nonce> {
         tracing::info!(?contract_address, "get_nonce_at");
 
-        let block_id = gen::BlockId::BlockTag(gen::BlockTag::Latest);
+        let block_id = gen::BlockId::BlockHash {
+            block_hash: gen::BlockHash(self.state.block_hash.clone()),
+        };
 
         let felt: gen::Felt = contract_address.0.key().try_into()?;
         let contract_address = gen::Address(felt);
@@ -218,12 +226,14 @@ impl StateReader for StateProxy {
     }
 
     fn get_class_hash_at(
-        &mut self,
+        &self,
         contract_address: ContractAddress,
     ) -> StateResult<ClassHash> {
         tracing::info!(?contract_address, "get_class_hash_at");
 
-        let block_id = gen::BlockId::BlockTag(gen::BlockTag::Latest);
+        let block_id = gen::BlockId::BlockHash {
+            block_hash: gen::BlockHash(self.state.block_hash.clone()),
+        };
 
         let felt: gen::Felt = contract_address.0.key().try_into()?;
         let contract_address = gen::Address(felt);
@@ -237,12 +247,14 @@ impl StateReader for StateProxy {
     }
 
     fn get_compiled_contract_class(
-        &mut self,
+        &self,
         class_hash: ClassHash,
     ) -> StateResult<ContractClass> {
         tracing::info!(?class_hash, "get_compiled_contract_class");
 
-        let block_id = gen::BlockId::BlockTag(gen::BlockTag::Latest);
+        let block_id = gen::BlockId::BlockHash {
+            block_hash: gen::BlockHash(self.state.block_hash.clone()),
+        };
 
         let class_hash: gen::Felt = class_hash.0.try_into()?;
 
@@ -255,7 +267,7 @@ impl StateReader for StateProxy {
     }
 
     fn get_compiled_class_hash(
-        &mut self,
+        &self,
         class_hash: ClassHash,
     ) -> StateResult<CompiledClassHash> {
         tracing::info!(?class_hash, "get_compiled_class_hash");
@@ -263,7 +275,7 @@ impl StateReader for StateProxy {
     }
 }
 
-impl BlockifierState for StateProxy {
+impl<T: gen::client::blocking::HttpClient> BlockifierState for StateProxy<T> {
     fn set_storage_at(
         &mut self,
         contract_address: ContractAddress,
@@ -271,12 +283,6 @@ impl BlockifierState for StateProxy {
         value: StarkFelt,
     ) -> StateResult<()> {
         tracing::info!(?contract_address, ?key, ?value, "set_storage_at");
-        self.diff
-            .storage_updates
-            .entry(contract_address)
-            .or_default()
-            .entry(key)
-            .or_insert(value);
         Ok(())
     }
 
@@ -285,10 +291,6 @@ impl BlockifierState for StateProxy {
         contract_address: ContractAddress,
     ) -> StateResult<()> {
         tracing::info!(?contract_address, "increment_nonce");
-        let nonce: &mut Nonce =
-            self.diff.address_to_nonce.entry(contract_address).or_default();
-        let value = *nonce;
-        *nonce = value.try_increment()?;
         Ok(())
     }
 
@@ -298,8 +300,6 @@ impl BlockifierState for StateProxy {
         class_hash: ClassHash,
     ) -> StateResult<()> {
         tracing::info!(?contract_address, ?class_hash, "set_class_hash_at");
-        *self.diff.address_to_class_hash.entry(contract_address).or_default() =
-            class_hash;
         Ok(())
     }
 
@@ -322,17 +322,7 @@ impl BlockifierState for StateProxy {
             ?compiled_class_hash,
             "set_compiled_class_hash"
         );
-        *self
-            .diff
-            .class_hash_to_compiled_class_hash
-            .entry(class_hash)
-            .or_default() = compiled_class_hash;
         Ok(())
-    }
-
-    fn to_state_diff(&mut self) -> CommitmentStateDiff {
-        tracing::info!("to_state_diff");
-        self.diff.clone()
     }
 
     fn add_visited_pcs(&mut self, class_hash: ClassHash, pcs: &HashSet<usize>) {

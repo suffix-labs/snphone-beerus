@@ -10,7 +10,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::client::State as ClientState;
+use crate::client::{Http, State as ClientState};
 
 use crate::exe::err::Error;
 
@@ -61,7 +61,7 @@ fn serve_on(
 
     let ctx = Context {
         url: url.to_owned(),
-        client: Arc::new(gen::client::Client::with_client(url, client)),
+        client: Arc::new(gen::client::Client::new(url, Http(client))),
         state,
     };
 
@@ -111,7 +111,7 @@ impl IntoResponse for RpcError {
 #[derive(Clone)]
 struct Context {
     url: String,
-    client: Arc<gen::client::Client>,
+    client: Arc<gen::client::Client<Http>>,
     state: Arc<RwLock<ClientState>>,
 }
 
@@ -133,13 +133,6 @@ impl Context {
             block_hash: block.block_header.block_hash.0,
             root: block.block_header.new_root,
         })
-    }
-
-    async fn get_latest_state(
-        &self,
-    ) -> std::result::Result<ClientState, jsonrpc::Error> {
-        let block_id = gen::BlockId::BlockTag(gen::BlockTag::Latest);
-        self.get_state(block_id).await
     }
 
     async fn resolve_block_id(
@@ -291,14 +284,16 @@ impl gen::Rpc for Context {
     async fn call(
         &self,
         request: FunctionCall,
-        _block_id: BlockId,
+        block_id: BlockId,
     ) -> std::result::Result<Vec<Felt>, jsonrpc::Error> {
-        let client = gen::client::blocking::Client::new(&self.url);
+        let client = gen::client::blocking::Client::new(&self.url, Http::new());
+        let state = self.state.read().await.clone();
 
         // TODO: address that effectively only the 'latest' block is supported
-        let state_root = self.get_latest_state().await?.root;
+        tracing::warn!(requested_block=?block_id, current_state=?state, "call");
+
         let call_info = tokio::task::spawn_blocking(move || {
-            crate::exe::call(&client, request, state_root)
+            crate::exe::call(client.clone(), request, state)
         })
         .await
         .map_err(|e| {
@@ -343,6 +338,13 @@ impl gen::Rpc for Context {
     ) -> std::result::Result<GetBlockTransactionCountResult, jsonrpc::Error>
     {
         self.client.getBlockTransactionCount(block_id).await
+    }
+
+    async fn getBlockWithReceipts(
+        &self,
+        block_id: BlockId,
+    ) -> std::result::Result<GetBlockWithReceiptsResult, jsonrpc::Error> {
+        self.client.getBlockWithReceipts(block_id).await
     }
 
     async fn getBlockWithTxHashes(
@@ -461,7 +463,7 @@ impl gen::Rpc for Context {
     async fn getTransactionReceipt(
         &self,
         transaction_hash: TxnHash,
-    ) -> std::result::Result<GetTransactionReceiptResult, jsonrpc::Error> {
+    ) -> std::result::Result<TxnReceiptWithBlockInfo, jsonrpc::Error> {
         self.client.getTransactionReceipt(transaction_hash).await
     }
 
@@ -538,7 +540,10 @@ mod tests {
         matchers::any, Mock, MockGuard, MockServer, ResponseTemplate,
     };
 
-    use crate::rpc::{BlockHash, BlockId, BlockNumber, BlockTag, Felt};
+    use crate::{
+        client::Http,
+        rpc::{BlockHash, BlockId, BlockNumber, BlockTag, Felt},
+    };
 
     use super::{client::Client, ClientState, Context};
 
@@ -555,9 +560,10 @@ mod tests {
         url_client: &str,
         state: ClientState,
     ) -> Context {
+        let client = reqwest::Client::new();
         Context {
             url: url_local.to_string(),
-            client: Arc::new(Client::new(url_client)),
+            client: Arc::new(Client::new(url_client, Http(client))),
             state: Arc::new(RwLock::new(state)),
         }
     }

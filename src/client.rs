@@ -1,9 +1,11 @@
 use eyre::{Context, Result};
 
-use crate::eth::EthereumClient;
+use crate::config::{check_chain_id, Config};
+use crate::eth::{EthereumClient, Helios};
 use crate::gen::client::Client as StarknetClient;
-use crate::gen::{BlockId, Felt, Rpc};
-use crate::{config::Config, gen::FunctionCall};
+use crate::gen::{gen, Felt, FunctionCall, Rpc};
+
+const RPC_SPEC_VERSION: &str = "0.7.1";
 
 #[derive(Debug, Clone)]
 pub struct State {
@@ -12,29 +14,148 @@ pub struct State {
     pub root: Felt,
 }
 
-pub struct Client {
-    starknet: StarknetClient,
-    ethereum: EthereumClient,
+async fn post<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    request: Q,
+) -> std::result::Result<R, iamgroot::jsonrpc::Error> {
+    let response = client
+        .post(url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| {
+            iamgroot::jsonrpc::Error::new(
+                32101,
+                format!("request failed: {e:?}"),
+            )
+        })?
+        .json()
+        .await
+        .map_err(|e| {
+            iamgroot::jsonrpc::Error::new(
+                32102,
+                format!("invalid response: {e:?}"),
+            )
+        })?;
+    Ok(response)
 }
 
-impl Client {
-    pub async fn new(config: &Config) -> Result<Self> {
-        let starknet = StarknetClient::new(&config.starknet_rpc);
-        let ethereum = EthereumClient::new(config).await?;
-        Ok(Self { starknet, ethereum })
+impl PartialEq<State> for State {
+    fn eq(&self, other: &State) -> bool {
+        self.block_number == other.block_number
+            && self.root.as_ref() == other.root.as_ref()
+            && self.block_hash.as_ref() == other.block_hash.as_ref()
+    }
+}
+
+#[derive(Clone)]
+pub struct Http(pub reqwest::Client);
+
+impl Http {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(reqwest::Client::new())
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl gen::client::HttpClient for Http {
+    async fn post(
+        &self,
+        url: &str,
+        request: &iamgroot::jsonrpc::Request,
+    ) -> std::result::Result<
+        iamgroot::jsonrpc::Response,
+        iamgroot::jsonrpc::Error,
+    > {
+        post(&self.0, url, request).await
+    }
+}
+
+impl gen::client::blocking::HttpClient for Http {
+    fn post(
+        &self,
+        url: &str,
+        request: &iamgroot::jsonrpc::Request,
+    ) -> std::result::Result<
+        iamgroot::jsonrpc::Response,
+        iamgroot::jsonrpc::Error,
+    > {
+        #[cfg(target_arch = "wasm32")]
+        unreachable!("Blocking HTTP attempt: url={url} request={request:?}");
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            ureq::post(url)
+                .send_json(request)
+                .map_err(|e| {
+                    iamgroot::jsonrpc::Error::new(33101, e.to_string())
+                })?
+                .into_json()
+                .map_err(|e| {
+                    iamgroot::jsonrpc::Error::new(33102, e.to_string())
+                })
+        }
+    }
+}
+
+pub struct Client<
+    T: gen::client::HttpClient
+        + gen::client::blocking::HttpClient
+        + Clone
+        + 'static,
+> {
+    starknet: StarknetClient<T>,
+    ethereum: EthereumClient,
+    http: T,
+}
+
+impl<
+        T: gen::client::HttpClient
+            + gen::client::blocking::HttpClient
+            + Clone
+            + 'static,
+    > Client<T>
+{
+    pub async fn new(config: &Config, http: T) -> Result<Self> {
+        let starknet = StarknetClient::new(&config.starknet_rpc, http.clone());
+        let rpc_spec_version = starknet.specVersion().await?;
+        if rpc_spec_version != RPC_SPEC_VERSION {
+            eyre::bail!("RPC spec version mismatch: expected {RPC_SPEC_VERSION} but got {rpc_spec_version}");
+        }
+        let network =
+            check_chain_id(&config.ethereum_rpc, &config.starknet_rpc).await?;
+        let ethereum = EthereumClient::new(config, network).await?;
+        Ok(Self { starknet, ethereum, http })
     }
 
-    pub async fn start(&self) -> Result<()> {
-        self.ethereum.start().await
+    pub fn ethereum(&self) -> &Helios {
+        &self.ethereum.helios
     }
 
-    pub async fn call_starknet(
+    pub fn starknet(&self) -> &StarknetClient<T> {
+        &self.starknet
+    }
+
+    pub fn execute(
         &self,
         request: FunctionCall,
-        block_id: BlockId,
+        state: State,
     ) -> Result<Vec<Felt>> {
-        let ret = self.starknet.call(request, block_id).await?;
-        Ok(ret)
+        let client = gen::client::blocking::Client::new(
+            &self.starknet.url,
+            self.http.clone(),
+        );
+        let call_info = crate::exe::call(client, request, state)?;
+        call_info
+            .execution
+            .retdata
+            .0
+            .into_iter()
+            .map(|felt| as_felt(&felt.to_bytes_be()))
+            .collect()
     }
 
     pub async fn get_state(&self) -> Result<State> {
@@ -49,11 +170,6 @@ impl Client {
             block_hash: as_felt(block_hash.as_bytes())?,
             root: as_felt(state_root.as_bytes())?,
         })
-    }
-
-    pub async fn spec_version(&self) -> Result<String> {
-        let version = self.starknet.specVersion().await?;
-        Ok(version)
     }
 }
 

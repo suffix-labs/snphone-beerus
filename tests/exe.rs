@@ -1,12 +1,12 @@
 use beerus::{
-    client::State,
+    client::{Http, State},
     exe::call,
-    gen::{self, blocking::Rpc, client::blocking::Client, Felt, FunctionCall},
+    gen::{self, blocking::Rpc, client::blocking::Client, FunctionCall},
 };
 
 mod common;
 
-use common::Error;
+use common::err::Error;
 
 #[test]
 fn test_call_deprecated_contract_class() -> Result<(), Error> {
@@ -33,8 +33,8 @@ fn test_call_deprecated_contract_class() -> Result<(), Error> {
     });
     let function_call: FunctionCall = serde_json::from_value(json)?;
 
-    let state_root = Felt::try_new("0x0")?;
-    let call_info = call(&client, function_call, state_root)?;
+    let state = get_latest_state(&client);
+    let call_info = call(client, function_call, state)?;
 
     assert!(call_info.execution.retdata.0.is_empty());
 
@@ -52,16 +52,19 @@ fn test_call_regular_contract_class() -> Result<(), Error> {
     });
     let function_call: FunctionCall = serde_json::from_value(json)?;
 
-    let state_root = get_latest_state(&client).root;
-    let call_info = call(&client, function_call, state_root)?;
+    let state = get_latest_state(&client);
+    let call_info = call(client, function_call, state)?;
 
     assert_eq!(call_info.execution.retdata.0.len(), 1);
-    assert_eq!(call_info.execution.retdata.0[0], "0x4574686572".try_into()?);
+    assert_eq!(
+        call_info.execution.retdata.0[0].to_hex_string(),
+        "0x4574686572"
+    );
 
     Ok(())
 }
 
-fn get_state(client: &Client, block_id: gen::BlockId) -> State {
+fn get_state(client: &Client<Http>, block_id: gen::BlockId) -> State {
     let block = client.getBlockWithTxHashes(block_id).unwrap();
     let gen::GetBlockWithTxHashesResult::BlockWithTxHashes(block) = block
     else {
@@ -74,7 +77,7 @@ fn get_state(client: &Client, block_id: gen::BlockId) -> State {
     }
 }
 
-fn get_latest_state(client: &Client) -> State {
+fn get_latest_state(client: &Client<Http>) -> State {
     let block_id = gen::BlockId::BlockTag(gen::BlockTag::Latest);
     get_state(client, block_id)
 }

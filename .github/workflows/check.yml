@@ -14,19 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    if: ${{ !startsWith(github.head_ref, 'dependabot/') }}
-    runs-on: ubuntu-latest
-    env:
-      BEERUS_TEST_RUN: 1
-      BEERUS_TEST_STARKNET_URL: ${{ secrets.STARKNET_RPC_0_6_0_MAINNET }}
-    steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --features skip-zero-root-validation
-
-  check:
+  quick-check:
     if: startsWith(github.head_ref, 'dependabot/')
     runs-on: ubuntu-latest
     steps:
@@ -35,15 +23,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --tests --examples
 
-  check-wasm:
-    if: false ## disabled until wasm effort is in progress
+  test:
+    if: ${{ !startsWith(github.head_ref, 'dependabot/') }}
+    runs-on: ubuntu-latest
+    env:
+      BEERUS_TEST_RUN: 1
+      STARKNET_MAINNET_URL: https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_7/${{ secrets.ALCHEMY_KEY }}
+      STARKNET_SEPOLIA_URL: https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_7/${{ secrets.ALCHEMY_KEY }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: rm -rf /opt/hostedtoolcache
+      - run: cargo test -- --skip deploy_account_on_sepolia
+
+  wasm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: rustup target add wasm32-unknown-unknown
-      - run: cargo check --target wasm32-unknown-unknown --no-default-features
+      - run: cd web/beerus-web && cargo check --target wasm32-unknown-unknown
 
   clippy:
     if: ${{ !startsWith(github.head_ref, 'dependabot/') }}
@@ -80,6 +81,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: crate-ci/typos@v1.21.0
+      - uses: crate-ci/typos@v1.24.1
         with:
           files: .

@@ -28,4 +28,7 @@ node_modules
 
 tmp/
 
-.config.toml
+pkg/
+dist/
+node_modules/
+.parcel-cache/

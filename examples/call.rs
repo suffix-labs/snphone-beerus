@@ -1,8 +1,6 @@
-use std::path::PathBuf;
-
+use beerus::client::{Client, Http};
 use beerus::config::Config;
-use beerus::gen::{Address, BlockNumber, Felt, FunctionCall};
-use beerus::{client::Client, gen::BlockId};
+use beerus::gen::{Address, Felt, FunctionCall};
 use eyre::{Context, Result};
 
 #[tokio::main]
@@ -13,23 +11,18 @@ async fn main() -> Result<()> {
         .context("ALCHEMY_API_KEY is missing")?;
 
     let config = Config {
-        network: helios::config::networks::Network::MAINNET,
-        eth_execution_rpc: format!(
+        ethereum_rpc: format!(
             "https://eth-mainnet.g.alchemy.com/v2/{api_key}"
         ),
         starknet_rpc: format!(
-            "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0.6/{api_key}"
+            "https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_7/{api_key}"
         ),
-        data_dir: PathBuf::from("tmp"),
-        poll_secs: 300,
-        rpc_addr: ([127, 0, 0, 1], 3030).into(),
+        data_dir: "tmp".to_owned(),
     };
 
-    let beerus = Client::new(&config).await?;
-    beerus.start().await?;
+    let http = Http::new();
+    let beerus = Client::new(&config, http).await?;
 
-    let block_id =
-        BlockId::BlockNumber { block_number: BlockNumber::try_new(33482)? };
     let calldata = FunctionCall {
         contract_address: Address(Felt::try_new(
             "0x49d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",
@@ -40,7 +33,8 @@ async fn main() -> Result<()> {
         calldata: vec![],
     };
 
-    let res = beerus.call_starknet(calldata, block_id).await?;
+    let state = beerus.get_state().await?;
+    let res = beerus.execute(calldata, state)?;
     println!("{:#?}", res);
 
     Ok(())
